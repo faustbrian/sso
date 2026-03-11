@@ -1,0 +1,78 @@
+<?php declare(strict_types=1);
+
+use Cline\SSO\Configuration\Configuration;
+use Cline\VariableKeys\Enums\PrimaryKeyType;
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class() extends Migration
+{
+    public function up(): void
+    {
+        $primaryKeyType = PrimaryKeyType::tryFrom(Configuration::auth()->primaryKeyType()) ?? PrimaryKeyType::ID;
+        $ownerKeyType = PrimaryKeyType::tryFrom(Configuration::owner()->keyType()) ?? $primaryKeyType;
+        $principalKeyType = PrimaryKeyType::tryFrom(Configuration::principal()->keyType()) ?? $primaryKeyType;
+        $providersTable = Configuration::tables()->providers();
+        $externalIdentitiesTable = Configuration::tables()->externalIdentities();
+        $ownerColumn = Configuration::owner()->foreignKeyColumn();
+        $principalColumn = Configuration::principal()->foreignKeyColumn();
+
+        Schema::create($providersTable, function (Blueprint $table) use ($primaryKeyType, $ownerColumn, $ownerKeyType): void {
+            $table->variablePrimaryKey($primaryKeyType);
+            $table->variableForeignKey($ownerColumn, $ownerKeyType);
+            $table->string('driver');
+            $table->string('scheme')->unique();
+            $table->string('display_name');
+            $table->string('authority');
+            $table->string('client_id');
+            $table->text('client_secret');
+            $table->string('valid_issuer')->nullable();
+            $table->boolean('validate_issuer')->default(true);
+            $table->boolean('enabled')->default(false);
+            $table->boolean('is_default')->default(false);
+            $table->boolean('enforce_sso')->default(false);
+            $table->boolean('scim_enabled')->default(false);
+            $table->string('scim_token_hash')->nullable()->index();
+            $table->timestamp('scim_last_used_at')->nullable();
+            $table->timestamp('last_used_at')->nullable();
+            $table->timestamp('last_login_succeeded_at')->nullable();
+            $table->timestamp('last_login_failed_at')->nullable();
+            $table->text('last_failure_reason')->nullable();
+            $table->timestamp('last_metadata_refreshed_at')->nullable();
+            $table->timestamp('last_metadata_refresh_failed_at')->nullable();
+            $table->text('last_metadata_refresh_error')->nullable();
+            $table->timestamp('last_validated_at')->nullable();
+            $table->timestamp('last_validation_succeeded_at')->nullable();
+            $table->timestamp('last_validation_failed_at')->nullable();
+            $table->text('last_validation_error')->nullable();
+            $table->timestamp('secret_rotated_at')->nullable();
+            $table->json('settings')->nullable();
+            $table->timestamps();
+            $table->softDeletes();
+        });
+
+        Schema::create($externalIdentitiesTable, function (Blueprint $table) use ($primaryKeyType, $providersTable, $principalColumn, $principalKeyType): void {
+            $table->variablePrimaryKey($primaryKeyType);
+            $table->variableForeignKey($principalColumn, $principalKeyType);
+            $table->variableForeignKey('sso_provider_id', $primaryKeyType)
+                ->constrained($providersTable)
+                ->cascadeOnDelete();
+            $table->string('issuer');
+            $table->string('subject');
+            $table->string('email_snapshot')->nullable();
+            $table->timestamps();
+            $table->unique(['sso_provider_id', 'issuer', 'subject']);
+            $table->index($principalColumn);
+        });
+    }
+
+    public function down(): void
+    {
+        $providersTable = Configuration::tables()->providers();
+        $externalIdentitiesTable = Configuration::tables()->externalIdentities();
+
+        Schema::dropIfExists($externalIdentitiesTable);
+        Schema::dropIfExists($providersTable);
+    }
+};
