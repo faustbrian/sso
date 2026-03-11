@@ -1,72 +1,102 @@
-# SSO Package Guide
+## `cline/sso` Implementation Guide
 
-## Overview
+This guide is for developers integrating `cline/sso` into a Laravel
+application.
 
-`cline/sso` is an opinionated Laravel package for:
+It is intentionally implementation-first:
 
-- browser-based SSO login flows
-- OpenID Connect (`oidc`) providers
-- SAML 2.0 (`saml2`) providers
-- SCIM 2.0 provisioning endpoints
-- provider metadata import and refresh
-- external identity linking
-- operational recovery and reconciliation tooling
+1. understand the package vocabulary
+2. install the package
+3. configure your app models
+4. bind the required contracts
+5. create a provider
+6. send users through the browser SSO flow
+7. optionally add SAML and SCIM
 
-The package owns its SSO persistence layer and exposes the subsystem
-through package services and contracts. Consumer applications are
-expected to provide only application-specific behavior, such as how a
-resolved external identity maps to a local account, how provisioning is
-performed, and where audit events should be written.
+If you want package terminology only, read
+[`TERMINOLOGY.md`](TERMINOLOGY.md). If you want to make the package work
+in your app, start here.
 
-The main package-facing runtime entry point is
-`Cline\SSO\SsoManager`.
+---
 
-For terminology and real-world mappings, read
-[`TERMINOLOGY.md`](TERMINOLOGY.md) first.
+## 1. What This Package Actually Owns
 
-## Mental Model
+`cline/sso` owns the SSO subsystem itself:
+
+- provider persistence
+- external identity persistence
+- browser SSO routes
+- OIDC flow
+- SAML flow
+- SCIM HTTP surface
+- metadata import and refresh
+- validation and recovery commands
+
+Your application still owns application-specific policy:
+
+- what model acts as the `owner`
+- what model acts as the `principal`
+- how an external identity resolves to a local principal
+- whether a principal may link or sign in
+- how SCIM should create, update, or remove local records
+- where audit events should be written
+
+That split is the core integration model:
+
+- package owns protocol and persistence
+- app owns business rules
+
+---
+
+## 2. Terminology You Must Understand
 
 The package uses four core terms:
 
-- `owner`: the local boundary that owns one or more SSO provider
-  configurations
-- `provider`: the upstream identity provider configuration
-- `subject`: the external identity asserted by that provider
-- `principal`: the local identity the package links the external subject
-  to
+- `owner`
+  The local boundary that owns an SSO provider configuration.
+- `provider`
+  The upstream SSO or IdP configuration.
+- `subject`
+  The external identity asserted by the provider.
+- `principal`
+  The local identity that subject maps to in your app.
 
-In a typical B2B Laravel app this often maps to:
+In a typical B2B Laravel app:
 
-- `owner` -> `Organization`, `Workspace`, `MerchantAccount`
-- `principal` -> `User`, `Member`, `Admin`
+- `owner` usually maps to `Organization`, `Workspace`, or `Account`
+- `principal` usually maps to `User`, `Member`, or `Admin`
 
-The package persists provider state and external identity links, but it
-does not define your application's principal, membership, or audit
-model.
+In `/Users/brian/Developer/api`, the mapping is:
 
-## What The Package Owns
+- `owner` = `Organization`
+- `provider` = one organization-owned SSO configuration
+- `subject` = Azure / Okta / SAML external identity
+- `principal` = local `User`
 
-The package owns:
+If this mapping is not clear yet, stop and read
+[`TERMINOLOGY.md`](TERMINOLOGY.md) first.
 
-- SSO provider persistence
-- external identity persistence
-- package migrations
-- package routes for browser login and SCIM
-- default Eloquent repositories
-- OIDC and SAML protocol handling
-- metadata import, validation, and refresh orchestration
-- SCIM HTTP protocol behavior
-- maintenance commands
+---
 
-The consumer application owns:
+## 3. Minimum Working Integration
 
-- principal lookup and provisioning policy
-- authorization for whether a principal may link or sign in
-- SCIM user and group mutation behavior
-- audit-event persistence or forwarding
-- application-specific UI around provider management
+If your goal is to get from zero to one working login flow, do this in
+order:
 
-## Installation
+1. install the package
+2. run the package migrations
+3. configure `owner` and `principal`
+4. bind the required contracts
+5. create one OIDC provider
+6. send users to the package SSO route
+7. verify the callback signs a principal in
+
+Do not start with SCIM. Do not start with SAML. Get one OIDC provider
+working first.
+
+---
+
+## 4. Installation
 
 Install the package:
 
@@ -74,14 +104,13 @@ Install the package:
 composer require cline/sso
 ```
 
-Publish the configuration if you want to customize it:
+Publish the configuration if you want to edit it in your app:
 
 ```bash
 php artisan vendor:publish --tag=sso-config
 ```
 
-Publish the migrations if you want them in your application instead of
-loading from the package:
+Publish the migrations if you want them copied into your application:
 
 ```bash
 php artisan vendor:publish --tag=sso-migrations
@@ -93,65 +122,171 @@ Run your migrations:
 php artisan migrate
 ```
 
-## Quick Start
+If you are happy letting the package load its own migrations, publishing
+them is optional.
 
-The fastest useful integration consists of four steps:
+---
 
-1. Install the package and run the SSO migrations.
-2. Configure your `owner` and `principal` model classes in
-   `config/sso.php`.
-3. Bind the required contracts.
-4. Create at least one provider record and send users to the package's
-   SSO entry route.
+## 5. The Config You Must Set
 
-### Minimal Configuration
+The package can boot without much configuration, but a real integration
+must set these values in `config/sso.php`.
 
-The important defaults live in `config/sso.php`:
+### `models.owner`
+
+This is the class that owns provider configuration.
+
+Example:
 
 ```php
-return [
-    'guard' => 'web',
-    'primary_key_type' => env('SSO_PRIMARY_KEY_TYPE', 'id'),
-
-    'login' => [
-        'redirect_to' => '/',
-        'redirect_route_name' => null,
-    ],
-
-    'routes' => [
-        'enabled' => true,
-        'prefix' => 'sso',
-        'name_prefix' => 'sso.',
-        'scim_enabled' => true,
-        'scim_prefix' => 'scim/v2',
-        'scim_name_prefix' => 'sso.scim.',
-    ],
-
-    'models' => [
-        'owner' => App\Models\Organization::class,
-        'principal' => App\Models\User::class,
-    ],
-];
+'models' => [
+    'owner' => App\Models\Organization::class,
+    'principal' => App\Models\User::class,
+],
 ```
 
-### Required Consumer Bindings
+### `models.principal`
 
-These contracts must be provided by the host application:
+This is the local identity model the package links subjects to.
 
-- `Cline\SSO\Contracts\PrincipalResolverInterface`
-- `Cline\SSO\Contracts\AuditSinkInterface`
-- `Cline\SSO\Contracts\ScimUserAdapterInterface`
-- `Cline\SSO\Contracts\ScimGroupAdapterInterface`
-- `Cline\SSO\Contracts\ScimReconcilerInterface`
-
-Bind them in your application service provider:
+Example:
 
 ```php
-use App\Support\Sso\AppAuditSink;
-use App\Support\Sso\AppPrincipalResolver;
-use App\Support\Sso\AppScimGroupAdapter;
-use App\Support\Sso\AppScimReconciler;
-use App\Support\Sso\AppScimUserAdapter;
+'models' => [
+    'owner' => App\Models\Organization::class,
+    'principal' => App\Models\User::class,
+],
+```
+
+### `guard`
+
+This is the Laravel guard used when the package signs principals in.
+
+Typical value:
+
+```php
+'guard' => 'web',
+```
+
+### `login.redirect_to` or `login.redirect_route_name`
+
+This controls where successful logins go.
+
+Use one of:
+
+```php
+'login' => [
+    'redirect_to' => '/',
+    'redirect_route_name' => null,
+],
+```
+
+or:
+
+```php
+'login' => [
+    'redirect_to' => '/',
+    'redirect_route_name' => 'dashboard',
+],
+```
+
+### `routes`
+
+These control whether package browser routes and SCIM routes are
+registered and what prefixes they use.
+
+Typical defaults:
+
+```php
+'routes' => [
+    'enabled' => true,
+    'prefix' => 'sso',
+    'name_prefix' => 'sso.',
+    'scim_enabled' => true,
+    'scim_prefix' => 'scim/v2',
+    'scim_name_prefix' => 'sso.scim.',
+],
+```
+
+If you want the package routes, leave them enabled.
+
+---
+
+## 6. Contracts Your App Must Bind
+
+This package is not usable without consumer bindings. These are the
+required integration points.
+
+### `PrincipalResolverInterface`
+
+This is the most important contract.
+
+Your implementation decides:
+
+- how to find a principal by email
+- how to find a principal from an existing external identity
+- whether the package may link a subject to a principal
+- whether the package may provision a new principal
+- how to produce a stable principal reference
+- whether a resolved principal may sign in
+- what should happen after login
+
+If you do not implement this well, your SSO behavior will be wrong even
+if the protocol layer is correct.
+
+### `AuditSinkInterface`
+
+This receives package audit events.
+
+Use it if you want:
+
+- database activity logs
+- external audit systems
+- structured internal event logging
+
+### `ScimUserAdapterInterface`
+
+This is required if you enable SCIM and want SCIM `Users` to mutate your
+application.
+
+It defines how the package should:
+
+- list local principals as SCIM users
+- create a local principal
+- replace a local principal
+- patch a local principal
+- resolve a local principal by SCIM identifier
+
+### `ScimGroupAdapterInterface`
+
+This is required if you want SCIM `Groups`.
+
+It defines how the package should:
+
+- list SCIM-manageable groups
+- create groups
+- patch groups
+- delete groups
+- resolve groups by SCIM identifier
+
+### `ScimReconcilerInterface`
+
+This is used by the package’s reconciliation command and scheduled sync
+work.
+
+Use it if your app needs to reconcile memberships or role assignments
+outside of request-time SCIM updates.
+
+### Example bindings
+
+Bind the contracts in a service provider:
+
+```php
+use App\Support\Sso\ActivityAuditSink;
+use App\Support\Sso\PrincipalResolver;
+use App\Support\Sso\ScimGroupAdapter;
+use App\Support\Sso\ScimReconciler;
+use App\Support\Sso\ScimUserAdapter;
 use Cline\SSO\Contracts\AuditSinkInterface;
 use Cline\SSO\Contracts\PrincipalResolverInterface;
 use Cline\SSO\Contracts\ScimGroupAdapterInterface;
@@ -160,561 +295,447 @@ use Cline\SSO\Contracts\ScimUserAdapterInterface;
 
 $this->app->singleton(
     PrincipalResolverInterface::class,
-    AppPrincipalResolver::class,
+    PrincipalResolver::class,
 );
 
 $this->app->singleton(
     AuditSinkInterface::class,
-    AppAuditSink::class,
+    ActivityAuditSink::class,
 );
 
 $this->app->singleton(
     ScimUserAdapterInterface::class,
-    AppScimUserAdapter::class,
+    ScimUserAdapter::class,
 );
 
 $this->app->singleton(
     ScimGroupAdapterInterface::class,
-    AppScimGroupAdapter::class,
+    ScimGroupAdapter::class,
 );
 
 $this->app->singleton(
     ScimReconcilerInterface::class,
-    AppScimReconciler::class,
+    ScimReconciler::class,
 );
 ```
 
-Once these bindings exist, the package can run the browser login flow,
-SCIM endpoints, metadata refresh commands, and external identity
-linking.
+---
 
-## Public Integration Surface
+## 7. The Main Package API You Should Use
 
-### `SsoManager`
-
-`Cline\SSO\SsoManager` is the normal package façade.
-
-Use it for:
-
-- listing enabled login providers
-- searching providers administratively
-- loading a provider by ID, scheme, or SCIM token hash
-- creating, updating, and deleting providers
-- finding, saving, and deleting external identity links
-- validating provider configuration
-- importing provider metadata
-- refreshing provider metadata
-
-Typical usage:
+The normal consumer-facing API is:
 
 ```php
-use Cline\SSO\Data\ProviderSearchCriteria;
-use Cline\SSO\Enums\BooleanFilter;
+Cline\SSO\SsoManager
+```
+
+Use `SsoManager` for normal package operations:
+
+- list login providers
+- search providers
+- create a provider
+- update a provider
+- delete a provider
+- import metadata
+- validate a provider
+- refresh metadata
+- look up or persist external identities
+
+Use repository interfaces only if you are intentionally replacing
+package persistence behavior.
+
+If you are building app code and asking “should I use the manager or the
+repository?”, the answer is almost always the manager.
+
+---
+
+## 8. Creating Your First OIDC Provider
+
+After installing the package and binding the contracts, create one OIDC
+provider.
+
+You can do that through your own admin UI or directly through
+`SsoManager`.
+
+Typical OIDC fields:
+
+- `driver` = `oidc`
+- `scheme`
+- `display_name`
+- `authority`
+- `client_id`
+- `client_secret`
+- `valid_issuer`
+- `validate_issuer`
+- `enabled`
+
+Example:
+
+```php
 use Cline\SSO\SsoManager;
 
-public function __invoke(SsoManager $sso): array
+public function __invoke(SsoManager $sso): void
 {
-    return $sso->searchProviders(
-        new ProviderSearchCriteria(
-            enabled: BooleanFilter::True,
-        ),
-    );
+    $sso->createProvider([
+        'owner_id' => 'org_123',
+        'driver' => 'oidc',
+        'scheme' => 'acme-entra',
+        'display_name' => 'Acme Entra ID',
+        'authority' => 'https://login.microsoftonline.com/acme/v2.0',
+        'client_id' => 'client-id',
+        'client_secret' => 'client-secret',
+        'valid_issuer' => 'https://login.microsoftonline.com/acme/v2.0',
+        'validate_issuer' => true,
+        'enabled' => true,
+    ]);
 }
 ```
 
-### Repository Contracts
+Your actual owner identifier and admin workflow will depend on your app.
 
-The repository contracts remain public:
+The important thing is:
 
-- `ProviderRepositoryInterface`
-- `ExternalIdentityRepositoryInterface`
+- the provider belongs to one `owner`
+- the provider uses `oidc`
+- the provider is enabled
 
-They are advanced seams for replacing persistence behavior. Most
-applications should keep the package defaults and work through
-`SsoManager`.
+---
 
-## Required Consumer Contracts
+## 9. Browser Login Flow
 
-### `PrincipalResolverInterface`
+Once a provider exists, the package browser flow is:
 
-This contract is the most important consumer-owned policy boundary.
+1. user visits the package SSO entry route
+2. user chooses a provider
+3. package redirects to the upstream IdP
+4. upstream IdP redirects back to the package callback
+5. package validates the response
+6. package resolves or provisions a local principal through your
+   `PrincipalResolverInterface`
+7. package signs the principal in with the configured guard
+8. package redirects to the configured post-login destination
 
-It answers:
+### Default routes
 
-- how the package finds a local principal by email
-- how the package resolves a principal from a linked external identity
-- whether a principal may be linked
-- whether a principal may be auto-provisioned
-- how to build a stable principal reference
-- whether the principal may sign in
-- which side effects should happen after login
+If package web routes are enabled, the browser entrypoint is under the
+configured SSO prefix.
 
-If you are integrating the package into an existing application, this
-contract is where your account-linking and access policy belongs.
+With default config:
 
-### `AuditSinkInterface`
+- entrypoint: `/sso`
+- redirect: `/sso/{scheme}/redirect`
+- callback: `/sso/{scheme}/callback`
 
-This receives structured package audit events. The package does not
-assume a storage backend or audit product.
+### How to link to the entrypoint
 
-Typical uses:
+Use the package route name:
 
-- write to an activity-log table
-- forward to a SIEM or webhook
-- emit security analytics events
+```php
+route('sso.index')
+```
 
-### `ScimUserAdapterInterface`
+Or whatever you configured via `routes.name_prefix` and
+`routes.index_name`.
 
-This maps your local principal/user model to SCIM `User` resources.
+### What your app must do during login
 
-It must provide:
+During login, the package needs your principal resolver to answer these
+questions:
 
-- list
-- create
-- find
-- replace
-- patch
+- Is there already a linked principal for this subject?
+- If not, can the package find one by email?
+- If it finds one, may the package link it?
+- If none exists, may the package provision one?
+- If a principal is found or provisioned, may that principal sign in?
 
-All returned data should already be SCIM-shaped arrays.
+If those answers are wrong, your login behavior will be wrong.
 
-### `ScimGroupAdapterInterface`
+---
 
-This maps your local group or role model to SCIM `Group` resources.
+## 10. OIDC Integration Notes
 
-It must provide:
+Use `oidc` when the upstream provider supports OpenID Connect.
 
-- list
-- create
-- find
-- patch
-- delete
+The package handles:
 
-### `ScimReconcilerInterface`
-
-This is the background reconciliation boundary. The package decides when
-reconciliation runs; your application decides what reconciliation means.
-
-Typical uses:
-
-- sync group membership from remote identity data
-- remove stale mappings
-- emit operational summaries
-
-## Configuration Reference
-
-The package configuration is grouped by concern.
-
-### `guard`
-
-The Laravel auth guard used for SSO sign-in.
-
-Use the same guard that manages session behavior for the principal type
-signing in through SSO.
-
-### `primary_key_type`
-
-Defines the package primary key strategy for package-owned models.
-
-Typical values:
-
-- `id`
-- `uuid`
-- `ulid`
-
-The package integrates this with `cline/variable-keys`.
-
-### `login`
-
-Controls post-login redirects.
-
-- `redirect_to`: direct path fallback
-- `redirect_route_name`: named route override
-
-If both are set, the route name wins.
-
-### `cache`
-
-Controls protocol metadata caching.
-
-- `discovery_ttl`: OIDC discovery document cache
-- `jwks_ttl`: OIDC signing key cache
-- `metadata_ttl`: generic provider metadata cache
-
-### `drivers`
-
-Maps configured provider driver names to strategy classes.
-
-Defaults:
-
-- `oidc` -> `Cline\SSO\Drivers\Oidc\OidcStrategy`
-- `saml2` -> `Cline\SSO\Drivers\Saml\SamlStrategy`
-
-You can replace or extend these if you need custom protocol behavior.
-
-### `routes`
-
-Controls route registration and naming.
-
-Browser login routes:
-
-- `enabled`
-- `middleware`
-- `prefix`
-- `name_prefix`
-- `index_name`
-- `callback_name`
-
-SCIM routes:
-
-- `scim_enabled`
-- `scim_prefix`
-- `scim_name_prefix`
-- `scim_middleware`
-
-### `models`
-
-Defines application model classes for:
-
-- `owner`
-- `principal`
-
-These are consumer model classes, not package persistence models.
-
-### `table_names`
-
-Controls the package table names for:
-
-- providers
-- external identities
-
-Use this only if you need non-default table names.
-
-### `foreign_keys`
-
-Controls how the package stores references to the consumer's owner and
-principal models.
-
-Each section contains package-facing persistence settings such as:
-
-- foreign key column
-- referenced key name
-- key type
-
-### `repositories`
-
-Advanced override point for replacing the default Eloquent repositories.
-
-Most consumers should keep the defaults.
-
-### `contracts`
-
-Defines the concrete classes the package resolves for:
-
-- principal resolver
-- audit sink
-- SCIM user adapter
-- SCIM group adapter
-- SCIM reconciler
-
-## Browser Routes
-
-When route registration is enabled, the package registers:
-
-- `GET /{prefix}` -> provider chooser page
-- `GET /{prefix}/{scheme}/redirect` -> begin external login
-- `GET|POST /{prefix}/{scheme}/callback` -> process provider callback
-
-By default with `prefix = sso`, that becomes:
-
-- `GET /sso`
-- `GET /sso/{scheme}/redirect`
-- `GET|POST /sso/{scheme}/callback`
-
-### Route Names
-
-By default:
-
-- chooser: `sso.index`
-- redirect: `sso.redirect`
-- callback: `sso.callback`
-
-These can be renamed through `routes.name_prefix`,
-`routes.index_name`, and `routes.callback_name`.
-
-## SCIM Routes
-
-When SCIM is enabled, the package registers:
-
-- `GET ServiceProviderConfig`
-- `GET Schemas`
-- `GET ResourceTypes`
-- `GET Users`
-- `POST Users`
-- `GET Users/{user}`
-- `PUT Users/{user}`
-- `PATCH Users/{user}`
-- `GET Groups`
-- `POST Groups`
-- `GET Groups/{group}`
-- `PATCH Groups/{group}`
-- `DELETE Groups/{group}`
-
-By default these are mounted under `/scim/v2`.
-
-The package applies the configured SCIM middleware stack and then its
-own SCIM authentication middleware alias internally.
-
-## Provider Records
-
-The package persists provider records for:
-
-- driver
-- scheme
-- display name
-- authority
-- client credentials
-- issuer validation settings
-- enablement and default-provider flags
-- SCIM enablement and token hash
-- metadata health and refresh timestamps
-- validation timestamps and failures
-- login health information
-- driver-specific settings
-
-This record is exposed to package consumers as
-`Cline\SSO\Data\SsoProviderRecord`.
-
-Most application code should consume that immutable record rather than
-package Eloquent models.
-
-## External Identities
-
-The package persists external identity links between:
-
-- provider
-- issuer
-- subject
-- local principal reference
-
-This is what makes later logins durable and deterministic.
-
-The public immutable representation is
-`Cline\SSO\Data\ExternalIdentityRecord`.
-
-## Driver Behavior
-
-### OIDC
-
-The built-in OIDC strategy supports:
-
-- discovery document lookup
-- JWKS retrieval and caching
+- discovery documents
+- JWKS loading and caching
 - ID token validation
-- issuer and audience checks
-- metadata import
-- metadata refresh
+- issuer validation
+- audience and authorized party checks
+- nonce validation
+- timing validation
 
-Use `oidc` for providers such as:
+The application does not need to implement JWT or discovery logic.
+
+What the application still decides:
+
+- whether the resolved principal may link
+- whether a principal may sign in
+- how local provisioning works
+
+Recommended first provider to integrate:
 
 - Microsoft Entra ID / Azure AD
 - Okta OIDC
 - Auth0 OIDC
 
-### SAML 2
+Get one OIDC provider working before attempting SAML.
 
-The built-in SAML strategy supports:
+---
 
-- redirect initiation
-- callback/assertion parsing
-- metadata import
-- metadata refresh
-- certificate handling
-- signed response validation
+## 11. SAML Integration Notes
+
+Use `saml2` when the upstream provider is SAML-based.
+
+The package handles:
+
+- SAML metadata parsing
+- assertion decoding
+- signature validation
+- issuer, audience, destination, and recipient checks
 - optional signed AuthnRequests
+- certificate rollover support
 
-Use `saml2` for providers exposing SAML-based identity federation.
+The application still decides principal resolution and authorization in
+the same way as OIDC.
 
-## Commands
+Recommended approach:
 
-The package provides three operational commands.
+1. make OIDC work first
+2. add one SAML provider
+3. verify the callback and linking path
+4. then add metadata import and refresh automation
 
-### `sso:refresh-metadata`
+---
 
-Refreshes metadata for matching providers.
+## 12. SCIM Integration Notes
 
-Options:
+SCIM is optional.
 
-- `--scheme=*`
-- `--dispatch-sync`
+Do not implement SCIM until browser login works.
 
-Use this after upstream issuer, endpoint, or certificate changes.
+### What the package owns
 
-### `sso:reconcile-scim-identities`
+The package owns the SCIM HTTP protocol layer:
 
-Reconciles SCIM-backed memberships for matching providers.
+- route registration
+- request validation
+- SCIM error responses
+- `Users`
+- `Groups`
+- `Schemas`
+- `ResourceTypes`
+- `ServiceProviderConfig`
 
-Options:
+### What your app must provide
 
-- `--scheme=*`
-- `--dispatch-sync`
+Your app must tell the package how SCIM changes affect your local data.
 
-Use this when:
+That is what the SCIM adapters are for:
 
-- reconciliation jobs were missed
-- adapter behavior changed
-- you need to repair provisioning drift
+- `ScimUserAdapterInterface`
+- `ScimGroupAdapterInterface`
+- `ScimReconcilerInterface`
 
-### `sso:recover-access`
+### Recommended rollout order
 
-Emergency recovery command that disables SSO enforcement for matching
-providers.
+1. support SCIM `Users`
+2. verify create, replace, and patch behavior
+3. support SCIM `Groups` if your app needs them
+4. add reconciliation if your app needs periodic drift correction
 
-Arguments and options:
+---
 
-- `ownerType?`
-- `ownerId?`
-- `--scheme=*`
-- `--disable-provider`
+## 13. Metadata Import, Validation, And Refresh
 
-Use this only for break-glass recovery scenarios.
+The package can import and refresh provider metadata.
 
-## Typical Login Flow
+Use these capabilities after the login flow itself is already working.
 
-The high-level browser flow is:
+Typical use cases:
 
-1. User loads the chooser page.
-2. User selects an enabled provider.
-3. Package redirects to the external provider.
-4. Provider calls back to the package callback route.
-5. Strategy validates the callback and resolves a trusted identity.
-6. Package tries to find a stored external identity link.
-7. If none exists, the package asks the principal resolver to:
-   - find by email
-   - decide whether linking is allowed
-   - optionally auto-provision
-8. Package persists the external identity link.
-9. Package asks whether the principal may sign in.
-10. Package signs in through the configured guard.
-11. Package runs post-login side effects through the resolver.
+- import OIDC discovery information
+- import SAML metadata
+- validate a provider before enabling it
+- periodically refresh metadata and keys
 
-## Typical SCIM Flow
+This belongs to the package because it is protocol infrastructure, not
+application business logic.
 
-The high-level SCIM flow is:
+What your app usually does with it:
 
-1. Remote SCIM client sends a bearer token.
-2. Package hashes the token and resolves the owning provider.
-3. Package verifies that SCIM is enabled for that provider.
-4. Package forwards the request to the configured SCIM adapter.
-5. Adapter returns SCIM-shaped arrays.
-6. Package serializes those arrays into SCIM responses.
+- expose admin actions to import or validate providers
+- show health information
+- surface refresh failures
 
-## Example Integration Shape
+---
 
-A common application setup looks like this:
+## 14. Package Commands
 
-- package owns `sso_providers`
-- package owns `external_identities`
-- app binds `PrincipalResolverInterface`
-- app binds audit sink and SCIM adapters
-- app uses `SsoManager` for provider-management UI and runtime reads
-- app keeps its own `Organization` and `User` models without renaming
-  them to match package vocabulary
-
-That means your application can stay domain-specific while the package
-owns protocol, persistence, and orchestration behavior.
-
-## Testing Your Integration
-
-Test your package integration at three levels:
-
-### 1. Login Flow
-
-Write targeted tests for:
-
-- chooser rendering
-- successful callback login
-- rejected callbacks
-- first-login linking
-- auto-provisioning rules
-- denial rules
-
-### 2. SCIM
-
-Write targeted tests for:
-
-- bearer token authentication
-- user list/create/show/replace/patch
-- group list/create/show/patch/delete
-- error envelope behavior
-
-### 3. Operations
-
-Write targeted tests for:
+The package includes operational commands for:
 
 - metadata refresh
-- reconciliation
-- emergency recovery
+- SCIM reconciliation
+- recovery and break-glass access handling
 
-The package itself uses this same testing shape. Its own tests are a
-good reference for expected behavior.
+These commands are part of the package’s operational layer. Your app
+should generally call them or schedule them, not reimplement them.
 
-## Troubleshooting
+Typical production setup:
 
-### Users can reach the chooser but login fails
+- schedule metadata refresh
+- schedule reconciliation if your app uses SCIM group or membership sync
+- keep recovery commands documented for operators
 
-Check:
+---
 
-- provider is enabled
-- provider scheme matches the route being used
-- principal resolver bindings are correct
-- provider credentials, authority, and issuer settings are correct
+## 15. Suggested Implementation Order
 
-### Callback fails after provider authentication
+If you are integrating into a real app, follow this order:
 
-Check:
+### Phase 1: Minimal OIDC login
 
-- callback route is reachable
-- route naming matches your configured callback route
-- OIDC issuer and JWKS settings
-- SAML signing and metadata settings
-- session state and nonce behavior in your middleware stack
+1. install the package
+2. run migrations
+3. configure `owner`, `principal`, and `guard`
+4. bind `PrincipalResolverInterface`
+5. bind `AuditSinkInterface`
+6. create one OIDC provider
+7. route users to the package SSO entrypoint
+8. verify login works
 
-### SCIM requests return unauthorized
+### Phase 2: Provider administration
 
-Check:
+1. build admin CRUD around `SsoManager`
+2. add validation
+3. add metadata import
+4. add provider health display
 
-- provider has `scim_enabled = true`
-- the SCIM bearer token was rotated into the provider record
-- your SCIM route middleware stack is not stripping auth headers
+### Phase 3: SAML
 
-### Principals are not linking as expected
+1. add one SAML provider
+2. verify metadata import
+3. verify callback and principal resolution
 
-Check your `PrincipalResolverInterface` implementation:
+### Phase 4: SCIM
 
-- `findPrincipalByEmail`
-- `canLinkPrincipal`
-- `provisionPrincipal`
-- `principalReference`
-- `canSignIn`
+1. implement `ScimUserAdapterInterface`
+2. test SCIM `Users`
+3. implement `ScimGroupAdapterInterface` if needed
+4. implement `ScimReconcilerInterface` if needed
 
-Most application-specific login issues belong there rather than inside
-the package core.
+This ordering keeps the integration manageable and avoids debugging too
+many moving parts at once.
 
-### Provider management works but app UI still feels package-shaped
+---
 
-Use package records and `SsoManager` in your UI layer, not package
-models. The package vocabulary is intentionally generic; your UI can
-translate it to domain-specific copy such as “organization” or “user”.
+## 16. Typical App Architecture
 
-## Recommended Consumer Rules
+A normal consumer app should look like this:
 
-For the cleanest package boundary:
+- package owns SSO persistence
+- package owns routes
+- package owns protocol handling
+- app binds contract implementations
+- app builds its own admin UI using `SsoManager`
 
-- use `SsoManager` for normal reads and writes
-- treat package models as internal
-- do not create parallel provider or external identity models
-- keep your business rules in the contract implementations
-- keep protocol and persistence concerns in the package
+What your app should not do:
 
-If you follow that split, consumers can integrate the package deeply
-without having package persistence details leak across the application.
+- reimplement OIDC token validation
+- reimplement SAML validation
+- create parallel provider persistence models
+- bypass the package with direct database writes unless you are doing
+  something truly unusual
+
+The normal extension points are contracts and `SsoManager`, not package
+internals.
+
+---
+
+## 17. Example Mapping For A Real App
+
+Here is the concrete mapping for a typical organization-based app:
+
+- `owner` = `Organization`
+- `principal` = `User`
+
+That means:
+
+- one organization owns one or more providers
+- one provider can assert many subjects
+- each subject can be linked to one local user
+
+Your principal resolver then decides:
+
+- how an OIDC email maps to a `User`
+- how a SAML subject maps to a `User`
+- whether an existing `User` may be linked
+- whether a `User` may sign in to that organization’s provider
+
+That is the intended package boundary.
+
+---
+
+## 18. Troubleshooting
+
+### “The package installs, but login still does not work”
+
+Usually one of these is missing:
+
+- your `owner` model config
+- your `principal` model config
+- your `PrincipalResolverInterface` binding
+- an enabled provider record
+
+### “The callback succeeds externally, but no one gets logged in”
+
+Usually the resolver or sign-in policy is refusing the principal:
+
+- principal not found
+- linking denied
+- provisioning denied
+- sign-in denied
+
+### “SCIM endpoints exist, but nothing changes in the app”
+
+That usually means you are still using null adapters:
+
+- `NullScimUserAdapter`
+- `NullScimGroupAdapter`
+- `NullScimReconciler`
+
+Bind real implementations.
+
+### “I don’t know whether to use the manager or the repositories”
+
+Use `SsoManager` unless you are deliberately replacing package
+persistence.
+
+### “Do I need to rename my app models to Owner and Principal?”
+
+No.
+
+Configure your real model classes in `config/sso.php`. The package
+vocabulary exists to keep the SSO subsystem unambiguous, not to force
+your app to rename domain models.
+
+---
+
+## 19. What To Read Next
+
+If you are still at the beginning:
+
+- read [`TERMINOLOGY.md`](TERMINOLOGY.md)
+- then implement the minimal OIDC flow from this guide
+
+If OIDC already works and you are extending the subsystem:
+
+- use this guide’s SAML and SCIM sections
+- then read the package config comments in [`config/sso.php`](config/sso.php)
+
+If you are building administration around the package:
+
+- use `SsoManager`
+- keep protocol behavior in the package
+- keep business rules in your application contracts
